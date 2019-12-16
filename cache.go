@@ -3,13 +3,13 @@ package cache
 import (
 	"bytes"
 	"crypto/sha1"
+	"encoding/gob"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
-	"encoding/gob"
 
 	"github.com/gin-contrib/cache/persistence"
 	"github.com/gin-gonic/gin"
@@ -36,6 +36,7 @@ func RegisterResponseCacheGob() {
 type cachedWriter struct {
 	gin.ResponseWriter
 	status  int
+	buffer  []byte
 	written bool
 	store   persistence.CacheStore
 	expire  time.Duration
@@ -64,7 +65,7 @@ func urlEscape(prefix string, u string) string {
 }
 
 func newCachedWriter(store persistence.CacheStore, expire time.Duration, writer gin.ResponseWriter, key string) *cachedWriter {
-	return &cachedWriter{writer, 0, false, store, expire, key}
+	return &cachedWriter{writer, 0, make([]byte, 0), false, store, expire, key}
 }
 
 func (w *cachedWriter) WriteHeader(code int) {
@@ -82,43 +83,40 @@ func (w *cachedWriter) Written() bool {
 }
 
 func (w *cachedWriter) Write(data []byte) (int, error) {
-	ret, err := w.ResponseWriter.Write(data)
-	if err == nil {
-		store := w.store
-		var cache responseCache
-		if err := store.Get(w.key, &cache); err == nil {
-			data = append(cache.Data, data...)
-		}
+	bytesWritten, err := w.ResponseWriter.Write(data)
 
-		//cache responses with a status code < 300
-		if w.Status() < 300 {
-			val := responseCache{
-				w.Status(),
-				w.Header(),
-				data,
-			}
-			err = store.Set(w.key, val, w.expire)
-			if err != nil {
-				// need logger
-			}
-		}
+	if err == nil {
+		w.buffer = append(w.buffer, data[0:bytesWritten]...)
 	}
-	return ret, err
+
+	return bytesWritten, err
 }
 
 func (w *cachedWriter) WriteString(data string) (n int, err error) {
-	ret, err := w.ResponseWriter.WriteString(data)
+	bytesWritten, err := w.ResponseWriter.WriteString(data)
+
+	if err == nil {
+		w.buffer = append(w.buffer, []byte(data)[0:bytesWritten]...)
+	}
+
+	return bytesWritten, err
+}
+
+func (w *cachedWriter) commitToCache() {
+	store := w.store
+
 	//cache responses with a status code < 300
-	if err == nil && w.Status() < 300 {
-		store := w.store
+	if w.Status() < 300 {
 		val := responseCache{
 			w.Status(),
 			w.Header(),
-			[]byte(data),
+			w.buffer,
 		}
-		store.Set(w.key, val, w.expire)
+		err := store.Set(w.key, val, w.expire)
+		if err != nil {
+			log.Println("Unable to store cache entry: " + err.Error())
+		}
 	}
-	return ret, err
 }
 
 // Cache Middleware
@@ -163,9 +161,8 @@ func CachePage(store persistence.CacheStore, expire time.Duration, handle gin.Ha
 			c.Writer = writer
 			handle(c)
 
-			// Drop caches of aborted contexts
-			if c.IsAborted() {
-				store.Delete(key)
+			if !c.IsAborted() {
+				writer.commitToCache()
 			}
 		} else {
 			c.Writer.WriteHeader(cache.Status)
@@ -192,6 +189,10 @@ func CachePageWithoutQuery(store persistence.CacheStore, expire time.Duration, h
 			writer := newCachedWriter(store, expire, c.Writer, key)
 			c.Writer = writer
 			handle(c)
+
+			if !c.IsAborted() {
+				writer.commitToCache()
+			}
 		} else {
 			c.Writer.WriteHeader(cache.Status)
 			for k, vals := range cache.Header {
@@ -229,9 +230,8 @@ func CachePageWithoutHeader(store persistence.CacheStore, expire time.Duration, 
 			c.Writer = writer
 			handle(c)
 
-			// Drop caches of aborted contexts
-			if c.IsAborted() {
-				store.Delete(key)
+			if !c.IsAborted() {
+				writer.commitToCache()
 			}
 		} else {
 			c.Writer.WriteHeader(cache.Status)
